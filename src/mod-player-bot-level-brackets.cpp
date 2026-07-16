@@ -4,8 +4,11 @@
 #include "ObjectMgr.h"
 #include "Chat.h"
 #include "CommandScript.h"
+#include "Group.h"
 #include "Log.h"
 #include "Mail.h"
+#include "Map.h"
+#include "ObjectAccessor.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "RandomPlayerbotMgr.h"
@@ -276,6 +279,13 @@ static bool IsHordePlayerBot(Player* bot)
     return bot && (bot->GetTeamId() == TEAM_HORDE);
 }
 
+static void RemoveBotFromPendingOneTimeCleanups(ObjectGuid guid)
+{
+    g_PendingOneTimeCleanups.erase(
+        std::remove(g_PendingOneTimeCleanups.begin(), g_PendingOneTimeCleanups.end(), guid),
+        g_PendingOneTimeCleanups.end());
+}
+
 
 /**
  * @brief Removes a bot from the list of pending level resets.
@@ -298,9 +308,7 @@ static void RemoveBotFromPendingResets(Player* bot)
         g_PendingLevelResets.end()
     );
 
-    g_PendingOneTimeCleanups.erase(
-        std::remove(g_PendingOneTimeCleanups.begin(), g_PendingOneTimeCleanups.end(), guid),
-        g_PendingOneTimeCleanups.end());
+    RemoveBotFromPendingOneTimeCleanups(guid);
 }
 
 
@@ -901,15 +909,16 @@ static void ClampAndBalanceBrackets()
  * - The bot is not in combat.
  * - The bot is not in a battleground, arena, random dungeon, or battleground queue.
  * - The bot is not in flight.
- * - If the bot is in a group, all group members must also be bots.
+ * - Unless explicitly allowed for a same-level cleanup, all group members must also be bots.
  *
  * If any of these conditions are not met, the function returns false. If debugging is enabled via
  * g_BotDistFullDebugMode, detailed log messages are generated for each failure case.
  *
  * @param bot Pointer to the Player object representing the bot.
+ * @param allowRealPlayerGroup Whether a real-player group is allowed for this operation.
  * @return true if the bot is safe for level reset, false otherwise.
  */
-static bool IsBotSafeForLevelReset(Player* bot)
+static bool IsBotSafeForLevelReset(Player* bot, bool allowRealPlayerGroup = false)
 {
     if (!bot || !bot->GetSession() || bot->GetSession()->isLogingOut() || bot->IsDuringRemoveFromWorld())
     {
@@ -959,34 +968,48 @@ static bool IsBotSafeForLevelReset(Player* bot)
         }
         return false;
     }
-    if (Group* group = bot->GetGroup())
+    if (!allowRealPlayerGroup)
     {
-        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        if (Group* group = bot->GetGroup())
         {
-            Player* member = ref->GetSource();
-            if (member && member->IsInWorld() && !IsPlayerBot(member))
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
             {
-                if (g_BotDistFullDebugMode)
+                Player* member = ref->GetSource();
+                if (member && member->IsInWorld() && !IsPlayerBot(member))
                 {
-                    LOG_INFO("server.loading", "[BotLevelBrackets] Bot {} (Level {}) has non-bot group member {} (Level {}).", bot->GetName(), bot->GetLevel(), member->GetName(), member->GetLevel());
+                    if (g_BotDistFullDebugMode)
+                    {
+                        LOG_INFO("server.loading", "[BotLevelBrackets] Bot {} (Level {}) has non-bot group "
+                                 "member {} (Level {}).", bot->GetName(), bot->GetLevel(), member->GetName(),
+                                 member->GetLevel());
+                    }
+                    return false;
                 }
-                return false;
             }
         }
     }
     return true;
 }
 
+static bool IsBotSafeForOneTimeCleanup(Player* bot, bool allowRealPlayerGroup)
+{
+    if (!IsBotSafeForLevelReset(bot, allowRealPlayerGroup))
+        return false;
+
+    return !bot->GetMap() || !bot->GetMap()->IsDungeon();
+}
+
+static bool NeedsOneTimeCleanup(Player* bot)
+{
+    return g_OneTimeCleanupGeneration && IsPlayerRandomBot(bot) &&
+           bot->GetPlayerSetting(ONE_TIME_CLEANUP_SETTING_SOURCE, ONE_TIME_CLEANUP_SETTING_INDEX).value <
+               g_OneTimeCleanupGeneration;
+}
+
 static void QueueBotForOneTimeCleanup(Player* bot)
 {
-    if (!g_OneTimeCleanupGeneration || !IsPlayerRandomBot(bot))
+    if (!NeedsOneTimeCleanup(bot))
         return;
-
-    if (bot->GetPlayerSetting(ONE_TIME_CLEANUP_SETTING_SOURCE, ONE_TIME_CLEANUP_SETTING_INDEX).value >=
-        g_OneTimeCleanupGeneration)
-    {
-        return;
-    }
 
     ObjectGuid guid = bot->GetGUID();
     if (std::find(g_PendingOneTimeCleanups.begin(), g_PendingOneTimeCleanups.end(), guid) ==
@@ -1023,6 +1046,63 @@ static uint32 RemoveProblematicEquipmentMail(Player* bot)
     return removed;
 }
 
+static bool RunOneTimeCleanup(Player* bot, bool allowRealPlayerGroup, char const* reason, uint32& removedMails)
+{
+    if (!g_OneTimeCleanupGeneration || !IsPlayerRandomBot(bot) ||
+        !IsBotSafeForOneTimeCleanup(bot, allowRealPlayerGroup))
+    {
+        return false;
+    }
+
+    std::string const botName = bot->GetName();
+    uint8 const botLevel = bot->GetLevel();
+    removedMails = RemoveProblematicEquipmentMail(bot);
+    bot->UpdatePlayerSetting(ONE_TIME_CLEANUP_SETTING_SOURCE, ONE_TIME_CLEANUP_SETTING_INDEX,
+                             g_OneTimeCleanupGeneration);
+
+    PlayerbotFactory factory(bot, botLevel);
+    factory.Randomize(false, true);
+
+    LOG_INFO("server.loading", "[BotLevelBrackets] Rebuilt bot {} at level {} for one-time cleanup generation "
+             "{} (reason: {}, recovery mails removed: {}).", botName, botLevel, g_OneTimeCleanupGeneration,
+             reason, removedMails);
+    return true;
+}
+
+static bool GroupHasRealPlayer(Group* group)
+{
+    if (!group)
+        return false;
+
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (member && member->IsInWorld() && !IsPlayerBot(member))
+            return true;
+    }
+
+    return false;
+}
+
+static void CleanupPendingBotsForRealPlayerGroup(Group* group, char const* reason)
+{
+    if (!g_BotLevelBracketsEnabled || !g_OneTimeCleanupGeneration || !GroupHasRealPlayer(group))
+        return;
+
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* bot = ref->GetSource();
+        if (!NeedsOneTimeCleanup(bot))
+            continue;
+
+        uint32 removedMails = 0;
+        if (RunOneTimeCleanup(bot, true, reason, removedMails))
+            RemoveBotFromPendingOneTimeCleanups(bot->GetGUID());
+        else
+            QueueBotForOneTimeCleanup(bot);
+    }
+}
+
 static void ProcessPendingOneTimeCleanups()
 {
     if (!g_OneTimeCleanupGeneration || g_PendingOneTimeCleanups.empty())
@@ -1042,19 +1122,20 @@ static void ProcessPendingOneTimeCleanups()
             continue;
         }
 
-        if (!IsBotSafeForLevelReset(bot))
+        if (!NeedsOneTimeCleanup(bot))
+        {
+            it = g_PendingOneTimeCleanups.erase(it);
+            continue;
+        }
+
+        uint32 botRemovedMails = 0;
+        if (!RunOneTimeCleanup(bot, false, "scheduled sweep", botRemovedMails))
         {
             ++it;
             continue;
         }
 
-        removedMails += RemoveProblematicEquipmentMail(bot);
-        bot->UpdatePlayerSetting(ONE_TIME_CLEANUP_SETTING_SOURCE, ONE_TIME_CLEANUP_SETTING_INDEX,
-                                 g_OneTimeCleanupGeneration);
-
-        PlayerbotFactory factory(bot, bot->GetLevel());
-        factory.Randomize(false, true);
-
+        removedMails += botRemovedMails;
         it = g_PendingOneTimeCleanups.erase(it);
         ++processed;
     }
@@ -2010,11 +2091,27 @@ public:
     void OnPlayerLogin(Player* player) override
     {
         QueueBotForOneTimeCleanup(player);
+        CleanupPendingBotsForRealPlayerGroup(player ? player->GetGroup() : nullptr,
+                                             "logged in while grouped with a real player");
     }
 
     void OnPlayerLogout(Player* player) override
     {
         RemoveBotFromPendingResets(player);
+    }
+};
+
+class BotLevelBracketsGroupScript : public GroupScript
+{
+public:
+    BotLevelBracketsGroupScript() : GroupScript("BotLevelBracketsGroupScript") { }
+
+    void OnAddMember(Group* group, ObjectGuid guid) override
+    {
+        if (!guid)
+            return;
+
+        CleanupPendingBotsForRealPlayerGroup(group, "joined a real-player group");
     }
 };
 
@@ -2031,9 +2128,15 @@ public:
 
     ChatCommandTable GetCommands() const override
     {
+        static ChatCommandTable botLevelBracketsCommandTable =
+        {
+            { "cleanup", HandleCleanupSelectedBot, SEC_ADMINISTRATOR, Console::No }
+        };
+
         static ChatCommandTable commandTable =
         {
-            { "reload", HandleReloadConfig, SEC_ADMINISTRATOR, Console::No }
+            { "reload", HandleReloadConfig, SEC_ADMINISTRATOR, Console::No },
+            { "botlevelbrackets", botLevelBracketsCommandTable }
         };
         return commandTable;
     }
@@ -2044,6 +2147,41 @@ public:
         handler->SendSysMessage("Bot level brackets config reloaded.");
         return true;
     }
+
+    static bool HandleCleanupSelectedBot(ChatHandler* handler)
+    {
+        if (!g_BotLevelBracketsEnabled)
+        {
+            handler->SendSysMessage("Bot level brackets are disabled.");
+            return false;
+        }
+
+        if (!g_OneTimeCleanupGeneration)
+        {
+            handler->SendSysMessage("One-time cleanup is disabled. Set its Generation option above zero first.");
+            return false;
+        }
+
+        Player* bot = handler->getSelectedPlayer();
+        if (!bot || !IsPlayerRandomBot(bot))
+        {
+            handler->SendSysMessage("Select an online random Playerbot first.");
+            return false;
+        }
+
+        uint32 removedMails = 0;
+        if (!RunOneTimeCleanup(bot, true, "administrator command", removedMails))
+        {
+            handler->SendSysMessage("The selected bot must be alive, out of combat, outside a dungeon, battleground, "
+                                    "arena, queue, and flight.");
+            return false;
+        }
+
+        RemoveBotFromPendingOneTimeCleanups(bot->GetGUID());
+        handler->PSendSysMessage("Rebuilt {} at level {} with level-appropriate spells and gear; removed {} recovery "
+                                 "mails.", bot->GetName(), bot->GetLevel(), removedMails);
+        return true;
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -2052,13 +2190,13 @@ public:
 /**
  * @brief Registers the world, player, and command scripts for the Player Bot Level Brackets module.
  *
- * This function instantiates and adds the BotLevelBracketsWorldScript, BotLevelBracketsPlayerScript,
- * and BotLevelBracketsCommandScript to the script system, enabling custom logic and commands
- * for player bot level brackets within the game world.
+ * This function instantiates and adds the world, player, group, and command scripts to the script system,
+ * enabling custom logic and commands for player bot level brackets within the game world.
  */
 void Addmod_player_bot_level_bracketsScripts()
 {
     new BotLevelBracketsWorldScript();
     new BotLevelBracketsPlayerScript();
+    new BotLevelBracketsGroupScript();
     new BotLevelBracketsCommandScript();
 }

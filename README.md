@@ -12,7 +12,9 @@ The Bot Level Brackets module for AzerothCore ensures an even spread of player b
 
 With `BotLevelBrackets.CleanupGearOnLevelChange` enabled, a bracket move also deletes the bot's old equipped and carried items before Playerbots rebuilds its spellbook, talents, consumables, and equipment for the new level. This prevents down-leveled gear from being retained or moved into bags.
 
-For existing bot populations, set `BotLevelBrackets.OneTimeCleanup.Generation` to a positive number and enable `EnablePlayerSettings` in `worldserver.conf`. Every random bot is then rebuilt once at its current level. Work is throttled by `BotLevelBrackets.OneTimeCleanup.ProcessLimit`, and completion is stored per character so a restart resumes the sweep without rebuilding completed bots. Increase the generation only when another full sweep is wanted. When `BotLevelBrackets.OneTimeCleanup.RemoveRecoveryMail` is enabled, the sweep also removes only the core-generated mail for equipment that failed to load; ordinary mail is preserved.
+For existing bot populations, set `BotLevelBrackets.OneTimeCleanup.Generation` to a positive number and enable `EnablePlayerSettings` in `worldserver.conf`. Every random bot is then rebuilt once at its current level. The rebuild clears the old spellbook and items before relearning level-appropriate spells and creating level-appropriate gear. Work is throttled by `BotLevelBrackets.OneTimeCleanup.ProcessLimit`, and completion is stored per character so a restart resumes the sweep without rebuilding completed bots. Increase the generation only when another full sweep is wanted. When `BotLevelBrackets.OneTimeCleanup.RemoveRecoveryMail` is enabled, the sweep also removes only the core-generated mail for equipment that failed to load; ordinary mail is preserved.
+
+A pending bot is cleaned immediately when it joins a group containing a real player, or when it logs in while already in such a group, provided it is alive, out of combat, and has not entered a dungeon or another unsafe activity. This prevents a bot from entering a dungeon before the throttled sweep reaches it. For a recovery case, leave the dungeon, select the online random bot, and run `.botlevelbrackets cleanup`. The administrator command forces a same-level spell and gear rebuild even if that bot already has the current cleanup-generation marker.
 
 Features
 --------
@@ -22,6 +24,8 @@ Features
   Specify a desired percentage for bots in each bracket. The percentages for each faction must sum to 100.
 - **Dynamic Bot Adjustment:**  
   Bots in overpopulated brackets are adjusted to a random level within a bracket with a deficit.
+- **Priority Spell and Gear Cleanup:**
+  Pending bots are rebuilt at their current level before joining a real player's dungeon activity.
 - **Death Knight Level Safeguard:**  
   Death Knight bots are enforced a minimum level of 55.
 - **Guild Bot Exclusion:**  
@@ -212,6 +216,12 @@ To enable detailed debug logging, update the configuration file with one of the 
 
     BotLevelBrackets.FullDebugMode = 1
     BotLevelBrackets.LiteDebugMode = 1
+
+Administrator Commands
+----------------------
+
+- `.botlevelbrackets cleanup` — Select an online random bot and force a same-level rebuild of its spells, skills, talents, inventory, and equipment. The bot must be alive, out of combat, and outside dungeons, battlegrounds, arenas, queues, and flight.
+- `.reload` — Reload this module's configuration. This legacy top-level command is retained for compatibility.
 
 Troubleshooting
 ---------------
