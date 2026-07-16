@@ -10,6 +10,10 @@ Overview
 --------
 The Bot Level Brackets module for AzerothCore ensures an even spread of player bots across configurable level ranges (brackets). It periodically monitors bot levels and automatically adjusts them by transferring bots from overpopulated brackets to those with a deficit. During adjustments, bots are run through the normal Playerbots Randomize function, clearing and restoring them based on their new level. Bots that are not immediately safe for level reset (for example, those in combat or engaged in other activities) are flagged for pending adjustment and processed later when they become safe. Additionally, Death Knight bots are safeguarded to never be assigned a level below 55.
 
+With `BotLevelBrackets.CleanupGearOnLevelChange` enabled, a bracket move also deletes the bot's old equipped and carried items before Playerbots rebuilds its spellbook, talents, consumables, and equipment for the new level. This prevents down-leveled gear from being retained or moved into bags.
+
+For existing bot populations, set `BotLevelBrackets.OneTimeCleanup.Generation` to a positive number and enable `EnablePlayerSettings` in `worldserver.conf`. Every random bot is then rebuilt once at its current level. Work is throttled by `BotLevelBrackets.OneTimeCleanup.ProcessLimit`, and completion is stored per character so a restart resumes the sweep without rebuilding completed bots. Increase the generation only when another full sweep is wanted. When `BotLevelBrackets.OneTimeCleanup.RemoveRecoveryMail` is enabled, the sweep also removes only the core-generated mail for equipment that failed to load; ordinary mail is preserved.
+
 Features
 --------
 - **Configurable Faction-Specific Level Brackets:**  
@@ -79,6 +83,10 @@ BotLevelBrackets.LiteDebugMode               | Enables lite debug logging for th
 BotLevelBrackets.CheckFrequency              | Frequency (in seconds) at which the bot level distribution check is performed.                                                  | 300     | Positive Integer
 BotLevelBrackets.CheckFlaggedFrequency       | Frequency (in seconds) at which the bot level reset is performed for flagged bots that initially failed safety checks.             | 15      | Positive Integer
 BotLevelBrackets.FlaggedProcessLimit         | Maximum number of flagged bots to process per pending level change step.                                                           | 5       | Positive Integer
+BotLevelBrackets.CleanupGearOnLevelChange    | Deletes old equipped and carried items before autogearing a bot for its newly assigned level.                                        | 1       | 0 (off) / 1 (on)
+BotLevelBrackets.OneTimeCleanup.Generation   | Rebuilds every random bot once at its current level. Increase the value to request another sweep; 0 disables it. Requires `EnablePlayerSettings = 1`. | 0 | Non-negative integer
+BotLevelBrackets.OneTimeCleanup.ProcessLimit | Maximum bots rebuilt per flagged-processing step. Keep this low to avoid world-thread stalls.                                        | 1       | Non-negative integer
+BotLevelBrackets.OneTimeCleanup.RemoveRecoveryMail | Removes core-generated failed-equipment recovery mail during the sweep while preserving normal mail.                         | 1       | 0 (off) / 1 (on)
 BotLevelBrackets.Dynamic.UseDynamicDistribution | Enables dynamic bot distribution: when on, brackets with more real players get a higher share of bots in their level bracket, based on the weight below. | 0 | 0 (off) / 1 (on)
 BotLevelBrackets.Dynamic.RealPlayerWeight | Controls how much bots "follow" real player activity when dynamic distribution is enabled. 0.0 = bots always spread evenly; 1.0 = minimal effect; 10.0 = heavy effect; higher values = more bots go where players are, but the effect is scaled. | 1.0 | ≥ 0.0 (float)
 BotLevelBrackets.Dynamic.SyncFactions      | Enables synchronized brackets and weighting between Alliance and Horde factions when Dynamic Distribution is also enabled.                        | 0       | 0 (off) / 1 (on)

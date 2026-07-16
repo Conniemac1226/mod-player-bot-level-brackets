@@ -1,9 +1,11 @@
 #include "ScriptMgr.h"
+#include "CharacterCache.h"
 #include "Player.h"
 #include "ObjectMgr.h"
 #include "Chat.h"
 #include "CommandScript.h"
 #include "Log.h"
+#include "Mail.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "RandomPlayerbotMgr.h"
@@ -67,6 +69,10 @@ static bool   g_BotDistFullDebugMode      = false;
 static bool   g_BotDistLiteDebugMode      = false;
 static bool   g_UseDynamicDistribution  = false;
 static bool   g_IgnoreFriendListed = true;
+static bool   g_CleanupGearOnLevelChange = true;
+static uint32 g_OneTimeCleanupGeneration = 0;
+static uint32 g_OneTimeCleanupProcessLimit = 1;
+static bool   g_OneTimeCleanupRemoveRecoveryMail = true;
 static uint32 g_FlaggedProcessLimit = 5; // 0 = unlimited
 
 // Real player weight to boost bracket contributions.
@@ -96,6 +102,10 @@ struct PendingResetEntry
     const LevelRangeConfig* factionRanges;
 };
 static std::vector<PendingResetEntry> g_PendingLevelResets;
+static std::vector<ObjectGuid> g_PendingOneTimeCleanups;
+
+static constexpr char ONE_TIME_CLEANUP_SETTING_SOURCE[] = "BotLevelBrackets";
+static constexpr uint32 ONE_TIME_CLEANUP_SETTING_INDEX = 0;
 
 
 /**
@@ -126,6 +136,14 @@ static void LoadBotLevelBracketsConfig()
     g_RealPlayerWeight = sConfigMgr->GetOption<float>("BotLevelBrackets.Dynamic.RealPlayerWeight", 1.0f);
     g_SyncFactions = sConfigMgr->GetOption<bool>("BotLevelBrackets.Dynamic.SyncFactions", false);
     g_IgnoreFriendListed = sConfigMgr->GetOption<bool>("BotLevelBrackets.IgnoreFriendListed", true);
+    g_CleanupGearOnLevelChange =
+        sConfigMgr->GetOption<bool>("BotLevelBrackets.CleanupGearOnLevelChange", true);
+    g_OneTimeCleanupGeneration =
+        sConfigMgr->GetOption<uint32>("BotLevelBrackets.OneTimeCleanup.Generation", 0);
+    g_OneTimeCleanupProcessLimit =
+        sConfigMgr->GetOption<uint32>("BotLevelBrackets.OneTimeCleanup.ProcessLimit", 1);
+    g_OneTimeCleanupRemoveRecoveryMail =
+        sConfigMgr->GetOption<bool>("BotLevelBrackets.OneTimeCleanup.RemoveRecoveryMail", true);
     g_FlaggedProcessLimit = sConfigMgr->GetOption<uint32>("BotLevelBrackets.FlaggedProcessLimit", 5);
 
     std::string excludeNames = sConfigMgr->GetOption<std::string>("BotLevelBrackets.ExcludeNames", "");
@@ -279,6 +297,10 @@ static void RemoveBotFromPendingResets(Player* bot)
         ),
         g_PendingLevelResets.end()
     );
+
+    g_PendingOneTimeCleanups.erase(
+        std::remove(g_PendingOneTimeCleanups.begin(), g_PendingOneTimeCleanups.end(), guid),
+        g_PendingOneTimeCleanups.end());
 }
 
 
@@ -663,7 +685,7 @@ static void AdjustBotToRange(Player* bot, int targetRangeIndex, const LevelRange
     }
 
     PlayerbotFactory newFactory(bot, newLevel);
-    newFactory.Randomize(false);
+    newFactory.Randomize(false, g_CleanupGearOnLevelChange);
 
     // Force reset talents if equipment and spec persistence is enabled and bot rolled to max level
     // This is to fix an issue with Playerbots and how randomization works with equipment and spec persistence
@@ -953,6 +975,97 @@ static bool IsBotSafeForLevelReset(Player* bot)
         }
     }
     return true;
+}
+
+static void QueueBotForOneTimeCleanup(Player* bot)
+{
+    if (!g_OneTimeCleanupGeneration || !IsPlayerRandomBot(bot))
+        return;
+
+    if (bot->GetPlayerSetting(ONE_TIME_CLEANUP_SETTING_SOURCE, ONE_TIME_CLEANUP_SETTING_INDEX).value >=
+        g_OneTimeCleanupGeneration)
+    {
+        return;
+    }
+
+    ObjectGuid guid = bot->GetGUID();
+    if (std::find(g_PendingOneTimeCleanups.begin(), g_PendingOneTimeCleanups.end(), guid) ==
+        g_PendingOneTimeCleanups.end())
+    {
+        g_PendingOneTimeCleanups.push_back(guid);
+    }
+}
+
+static uint32 RemoveProblematicEquipmentMail(Player* bot)
+{
+    if (!g_OneTimeCleanupRemoveRecoveryMail)
+        return 0;
+
+    uint32 removed = 0;
+    for (Mail* mail : bot->GetMails())
+    {
+        bool const isProblematicEquipmentMail =
+            mail->state != MAIL_STATE_DELETED && mail->messageType == MAIL_NORMAL &&
+            mail->stationery == MAIL_STATIONERY_GM && mail->mailTemplateId == 0 &&
+            mail->sender == bot->GetGUID().GetCounter() && mail->money == 0 && mail->COD == 0 &&
+            mail->HasItems() &&
+            (mail->body == "There were problems with equipping item(s)." ||
+             mail->body == "There were problems with equipping one or several items");
+        if (!isProblematicEquipmentMail)
+            continue;
+
+        mail->state = MAIL_STATE_DELETED;
+        bot->m_mailsUpdated = true;
+        sCharacterCache->DecreaseCharacterMailCount(bot->GetGUID());
+        ++removed;
+    }
+
+    return removed;
+}
+
+static void ProcessPendingOneTimeCleanups()
+{
+    if (!g_OneTimeCleanupGeneration || g_PendingOneTimeCleanups.empty())
+        return;
+
+    uint32 processed = 0;
+    uint32 removedMails = 0;
+    for (auto it = g_PendingOneTimeCleanups.begin(); it != g_PendingOneTimeCleanups.end();)
+    {
+        if (g_OneTimeCleanupProcessLimit > 0 && processed >= g_OneTimeCleanupProcessLimit)
+            break;
+
+        Player* bot = ObjectAccessor::FindPlayer(*it);
+        if (!bot || !IsPlayerRandomBot(bot))
+        {
+            it = g_PendingOneTimeCleanups.erase(it);
+            continue;
+        }
+
+        if (!IsBotSafeForLevelReset(bot))
+        {
+            ++it;
+            continue;
+        }
+
+        removedMails += RemoveProblematicEquipmentMail(bot);
+        bot->UpdatePlayerSetting(ONE_TIME_CLEANUP_SETTING_SOURCE, ONE_TIME_CLEANUP_SETTING_INDEX,
+                                 g_OneTimeCleanupGeneration);
+
+        PlayerbotFactory factory(bot, bot->GetLevel());
+        factory.Randomize(false, true);
+
+        it = g_PendingOneTimeCleanups.erase(it);
+        ++processed;
+    }
+
+    if (processed > 0)
+    {
+        LOG_INFO("server.loading",
+                 "[BotLevelBrackets] One-time cleanup generation {} processed {} bots and removed {} recovery "
+                 "mails; {} bots remain queued.",
+                 g_OneTimeCleanupGeneration, processed, removedMails, g_PendingOneTimeCleanups.size());
+    }
 }
 
 /**
@@ -1325,6 +1438,7 @@ public:
             {
                 LOG_INFO("server.loading", "[BotLevelBrackets] Pending Level Resets Triggering.");
             }
+            ProcessPendingOneTimeCleanups();
             ProcessPendingLevelResets();
             m_flaggedTimer = 0;
         }
@@ -1346,6 +1460,12 @@ public:
         m_timer = 0;
 
         const auto& allPlayers = ObjectAccessor::GetPlayers();
+
+        for (auto const& [guid, player] : allPlayers)
+        {
+            (void)guid;
+            QueueBotForOneTimeCleanup(player);
+        }
 
         LoadRealPlayerGuildIds(allPlayers);
 
@@ -1887,7 +2007,12 @@ class BotLevelBracketsPlayerScript : public PlayerScript
 public:
     BotLevelBracketsPlayerScript() : PlayerScript("BotLevelBracketsPlayerScript") {}
 
-    void OnPlayerLogout(Player* player)
+    void OnPlayerLogin(Player* player) override
+    {
+        QueueBotForOneTimeCleanup(player);
+    }
+
+    void OnPlayerLogout(Player* player) override
     {
         RemoveBotFromPendingResets(player);
     }

@@ -43,6 +43,38 @@ BotLevelBrackets.CheckFlaggedFrequency = 15
 BotLevelBrackets.FlaggedProcessLimit = 5
 
 #
+#    BotLevelBrackets.CleanupGearOnLevelChange
+#        Description: Deletes old equipped and carried items before Playerbots rebuilds a bot for its new bracket.
+#                     This prevents higher-level equipment from being retained or moved into the bot's bags.
+#        Default:     1 (enabled)
+#                     Valid values: 0 (disabled) / 1 (enabled)
+BotLevelBrackets.CleanupGearOnLevelChange = 1
+
+#
+#    BotLevelBrackets.OneTimeCleanup.Generation
+#        Description: Runs a throttled full rebuild once for every random bot. The rebuild keeps the bot's current
+#                     level, deletes old equipped and carried items, and regenerates spells, talents, consumables,
+#                     and level-appropriate equipment. Increase this number to start a new sweep; 0 disables it.
+#                     Requires EnablePlayerSettings = 1 in worldserver.conf so completion survives restarts.
+#        Default:     0 (disabled)
+BotLevelBrackets.OneTimeCleanup.Generation = 0
+
+#
+#    BotLevelBrackets.OneTimeCleanup.ProcessLimit
+#        Description: Maximum bots rebuilt per CheckFlaggedFrequency step. A low value avoids world-thread stalls.
+#                     0 = unlimited (not recommended for large bot populations).
+#        Default:     1
+BotLevelBrackets.OneTimeCleanup.ProcessLimit = 1
+
+#
+#    BotLevelBrackets.OneTimeCleanup.RemoveRecoveryMail
+#        Description: Deletes only core-generated mail containing equipment that failed to load. Normal mail,
+#                     auction mail, quest mail, and player-created mail are preserved.
+#        Default:     1 (enabled)
+#                     Valid values: 0 (disabled) / 1 (enabled)
+BotLevelBrackets.OneTimeCleanup.RemoveRecoveryMail = 1
+
+#
 #    BotLevelBrackets.IgnoreGuildBotsWithRealPlayers
 #        Description: When enabled, bots that are in a guild with at least one real (non-bot) player are excluded 
 #                     from bot bracket calculations and will not be level changed or flagged.
