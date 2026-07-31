@@ -1,5 +1,5 @@
 #include "ScriptMgr.h"
-#include "CharacterCache.h"
+#include "MailMgr.h"
 #include "Player.h"
 #include "ObjectMgr.h"
 #include "Chat.h"
@@ -1039,7 +1039,7 @@ static uint32 RemoveProblematicEquipmentMail(Player* bot)
 
         mail->state = MAIL_STATE_DELETED;
         bot->m_mailsUpdated = true;
-        sCharacterCache->DecreaseCharacterMailCount(bot->GetGUID());
+        sMailMgr->OnMailDeleted(bot->GetGUID().GetCounter());
         ++removed;
     }
 
