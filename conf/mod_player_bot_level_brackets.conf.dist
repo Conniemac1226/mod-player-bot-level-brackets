@@ -126,6 +126,14 @@ BotLevelBrackets.ExcludeNames =
 #            sum of the Pct values for each faction remains 100.
 BotLevelBrackets.NumRanges = 9
 
+# Automatically generate evenly weighted decade brackets from
+# AiPlayerbot.RandomBotMinLevel and AiPlayerbot.RandomBotMaxLevel. Expansion
+# caps are merged into the preceding bracket (for example 50-60), avoiding a
+# singleton level-60/70/80 bracket. When enabled, NumRanges and RangeX settings
+# are ignored.
+# Default: 0 (disabled)
+BotLevelBrackets.AutoGenerateFromLevelCaps = 0
+
 #
 #    BotLevelBrackets.Dynamic.UseDynamicDistribution
 #        Description: Enables dynamic recalculation of bot distribution percentages based on the number of non-bot players 

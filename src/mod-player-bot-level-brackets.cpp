@@ -53,6 +53,7 @@ static uint8 g_NumRanges = 9;
 // Global variables to restrict bot levels.
 static uint8 g_RandomBotMinLevel = 1;
 static uint8 g_RandomBotMaxLevel = 80;
+static bool g_AutoGenerateFromLevelCaps = false;
 
 // Enable/disable the mod. Default is true.
 static bool g_BotLevelBracketsEnabled = true;
@@ -110,6 +111,76 @@ static std::vector<ObjectGuid> g_PendingOneTimeCleanups;
 static constexpr char ONE_TIME_CLEANUP_SETTING_SOURCE[] = "BotLevelBrackets";
 static constexpr uint32 ONE_TIME_CLEANUP_SETTING_INDEX = 0;
 
+static void GenerateLevelBracketsFromCaps()
+{
+    std::vector<LevelRangeConfig> generated;
+    uint16 lower = g_RandomBotMinLevel;
+
+    while (lower <= g_RandomBotMaxLevel)
+    {
+        uint16 upper = lower == 1 ? 9 : lower + 9;
+        upper = std::min<uint16>(upper, g_RandomBotMaxLevel);
+
+        // Do not create an overweight singleton bracket at an expansion cap
+        // (60, 70, or 80); include the cap in the preceding decade instead.
+        if (upper < g_RandomBotMaxLevel && g_RandomBotMaxLevel - upper < 10)
+            upper = g_RandomBotMaxLevel;
+
+        generated.push_back({static_cast<uint8>(lower), static_cast<uint8>(upper), 0});
+        lower = upper + 1;
+    }
+
+    if (generated.empty())
+    {
+        LOG_ERROR("server.loading", "[BotLevelBrackets] Cannot auto-generate brackets: minimum level {} exceeds maximum level {}.",
+            g_RandomBotMinLevel, g_RandomBotMaxLevel);
+        return;
+    }
+
+    uint8 const basePercent = 100 / generated.size();
+    uint8 remainder = 100 % generated.size();
+    for (LevelRangeConfig& range : generated)
+    {
+        range.desiredPercent = basePercent;
+        if (remainder > 0)
+        {
+            ++range.desiredPercent;
+            --remainder;
+        }
+    }
+
+    g_NumRanges = static_cast<uint8>(generated.size());
+    g_AllianceLevelRanges = generated;
+    g_HordeLevelRanges = generated;
+
+    LOG_INFO("server.loading", "[BotLevelBrackets] Auto-generated {} balanced ranges for levels {}-{}.",
+        g_NumRanges, g_RandomBotMinLevel, g_RandomBotMaxLevel);
+}
+
+static std::vector<int> CalculateDesiredCounts(std::vector<LevelRangeConfig> const& ranges, uint32 totalBots)
+{
+    std::vector<int> desiredCounts(ranges.size(), 0);
+    uint32 totalWeight = 0;
+    for (LevelRangeConfig const& range : ranges)
+        totalWeight += range.desiredPercent;
+
+    if (totalWeight == 0)
+        return desiredCounts;
+
+    uint64 cumulativeWeight = 0;
+    uint32 assigned = 0;
+    for (size_t i = 0; i < ranges.size(); ++i)
+    {
+        cumulativeWeight += ranges[i].desiredPercent;
+        uint32 const cumulativeTarget = static_cast<uint32>(
+            (cumulativeWeight * totalBots + totalWeight / 2) / totalWeight);
+        desiredCounts[i] = cumulativeTarget - assigned;
+        assigned = cumulativeTarget;
+    }
+
+    return desiredCounts;
+}
+
 
 /**
  * @brief Loads and initializes the configuration for player bot level brackets.
@@ -163,28 +234,46 @@ static void LoadBotLevelBracketsConfig()
     // Load the bot level restrictions.
     g_RandomBotMinLevel = static_cast<uint8>(sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotMinLevel", 1));
     g_RandomBotMaxLevel = static_cast<uint8>(sConfigMgr->GetOption<uint32>("AiPlayerbot.RandomBotMaxLevel", 80));
-
-    // Load the custom number of brackets.
-    g_NumRanges = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.NumRanges", 9));
-    g_AllianceLevelRanges.resize(g_NumRanges);
-    g_HordeLevelRanges.resize(g_NumRanges);
-
-    // Load Alliance configuration.
-    for (uint8 i = 0; i < g_NumRanges; ++i)
+    bool const automaticExpansionCaps =
+        sConfigMgr->GetOption<bool>("IndividualProgression.AutomaticExpansionCaps", false);
+    uint32 const progressionLimit =
+        sConfigMgr->GetOption<uint32>("IndividualProgression.ProgressionLimit", 0);
+    if (automaticExpansionCaps && progressionLimit > 0)
     {
-        std::string idx = std::to_string(i + 1);
-        g_AllianceLevelRanges[i].lower = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Alliance.Range" + idx + ".Lower", (i == 0 ? 1 : i * 10)));
-        g_AllianceLevelRanges[i].upper = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Alliance.Range" + idx + ".Upper", (i < g_NumRanges - 1 ? i * 10 + 9 : g_RandomBotMaxLevel)));
-        g_AllianceLevelRanges[i].desiredPercent = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Alliance.Range" + idx + ".Pct", 11));
+        g_RandomBotMaxLevel = progressionLimit < 8 ? 60 :
+            (progressionLimit < 13 ? 70 : 80);
     }
+    g_AutoGenerateFromLevelCaps =
+        sConfigMgr->GetOption<bool>("BotLevelBrackets.AutoGenerateFromLevelCaps", false);
 
-    // Load Horde configuration.
-    for (uint8 i = 0; i < g_NumRanges; ++i)
+    if (g_AutoGenerateFromLevelCaps)
     {
-        std::string idx = std::to_string(i + 1);
-        g_HordeLevelRanges[i].lower = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Horde.Range" + idx + ".Lower", (i == 0 ? 1 : i * 10)));
-        g_HordeLevelRanges[i].upper = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Horde.Range" + idx + ".Upper", (i < g_NumRanges - 1 ? i * 10 + 9 : g_RandomBotMaxLevel)));
-        g_HordeLevelRanges[i].desiredPercent = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Horde.Range" + idx + ".Pct", 11));
+        GenerateLevelBracketsFromCaps();
+    }
+    else
+    {
+        // Load the custom number of brackets.
+        g_NumRanges = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.NumRanges", 9));
+        g_AllianceLevelRanges.resize(g_NumRanges);
+        g_HordeLevelRanges.resize(g_NumRanges);
+
+        // Load Alliance configuration.
+        for (uint8 i = 0; i < g_NumRanges; ++i)
+        {
+            std::string idx = std::to_string(i + 1);
+            g_AllianceLevelRanges[i].lower = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Alliance.Range" + idx + ".Lower", (i == 0 ? 1 : i * 10)));
+            g_AllianceLevelRanges[i].upper = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Alliance.Range" + idx + ".Upper", (i < g_NumRanges - 1 ? i * 10 + 9 : g_RandomBotMaxLevel)));
+            g_AllianceLevelRanges[i].desiredPercent = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Alliance.Range" + idx + ".Pct", 11));
+        }
+
+        // Load Horde configuration.
+        for (uint8 i = 0; i < g_NumRanges; ++i)
+        {
+            std::string idx = std::to_string(i + 1);
+            g_HordeLevelRanges[i].lower = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Horde.Range" + idx + ".Lower", (i == 0 ? 1 : i * 10)));
+            g_HordeLevelRanges[i].upper = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Horde.Range" + idx + ".Upper", (i < g_NumRanges - 1 ? i * 10 + 9 : g_RandomBotMaxLevel)));
+            g_HordeLevelRanges[i].desiredPercent = static_cast<uint8>(sConfigMgr->GetOption<uint32>("BotLevelBrackets.Horde.Range" + idx + ".Pct", 11));
+        }
     }
 
     // If SyncFactions is enabled, ensure bracket definitions match exactly for both factions.
@@ -615,6 +704,12 @@ static uint8 GetRandomLevelInRange(const LevelRangeConfig& range)
     return urand(range.lower, range.upper);
 }
 
+static bool CanAssignBotToRange(Player const* bot, LevelRangeConfig const& range)
+{
+    return bot && range.lower <= range.upper &&
+        (bot->getClass() != CLASS_DEATH_KNIGHT || range.upper >= 55);
+}
+
 
 /**
  * @brief Adjusts the level of a player bot to fit within a specified level range bracket.
@@ -629,16 +724,16 @@ static uint8 GetRandomLevelInRange(const LevelRangeConfig& range)
  * @param targetRangeIndex Index of the target level range in the factionRanges array.
  * @param factionRanges Pointer to an array of LevelRangeConfig structures defining level brackets for the bot's faction.
  */
-static void AdjustBotToRange(Player* bot, int targetRangeIndex, const LevelRangeConfig* factionRanges)
+static bool AdjustBotToRange(Player* bot, int targetRangeIndex, const LevelRangeConfig* factionRanges)
 {
     if (!bot || !bot->IsInWorld() || !bot->GetSession() || bot->GetSession()->isLogingOut() || bot->IsDuringRemoveFromWorld())
     {
-        return;
+        return false;
     }
 
     if (targetRangeIndex < 0 || targetRangeIndex >= g_NumRanges)
     {
-        return;
+        return false;
     }
 
     if (bot->IsMounted())
@@ -663,7 +758,7 @@ static void AdjustBotToRange(Player* bot, int targetRangeIndex, const LevelRange
                          "[BotLevelBrackets] AdjustBotToRange: Cannot assign {} Death Knight '{}' ({}) to range {}-{} (below level 55).",
                          playerFaction, bot->GetName(), botOriginalLevel, lowerBound, upperBound);
             }
-            return;
+            return false;
         }
         if (lowerBound < 55)
         {
@@ -671,7 +766,7 @@ static void AdjustBotToRange(Player* bot, int targetRangeIndex, const LevelRange
         }
         if (lowerBound > upperBound)
         {
-            return;
+            return false;
         }
         newLevel = urand(lowerBound, upperBound);
     }
@@ -687,7 +782,7 @@ static void AdjustBotToRange(Player* bot, int targetRangeIndex, const LevelRange
                          "[BotLevelBrackets] AdjustBotToRange: Invalid range {}-{} for {} bot '{}'.",
                          range.lower, range.upper, playerFaction, bot->GetName());
             }
-            return;
+            return false;
         }
         newLevel = GetRandomLevelInRange(range);
     }
@@ -715,6 +810,7 @@ static void AdjustBotToRange(Player* bot, int targetRangeIndex, const LevelRange
     }
 
     ChatHandler(bot->GetSession()).SendSysMessage("[mod-bot-level-brackets] Your level has been reset.");
+    return true;
 }
 
 
@@ -1273,13 +1369,20 @@ static void ProcessPendingLevelResets()
 
             if (bot && bot->IsInWorld() && IsBotSafeForLevelReset(bot))
             {
-                AdjustBotToRange(bot, targetRange, it->factionRanges);
-                if (g_BotDistFullDebugMode)
+                bool const adjusted = AdjustBotToRange(bot, targetRange, it->factionRanges);
+                if (adjusted && g_BotDistFullDebugMode)
                 {
                     LOG_INFO("server.loading", "[BotLevelBrackets] Bot '{}' successfully reset to level range {}-{}.", bot->GetName(), it->factionRanges[targetRange].lower, it->factionRanges[targetRange].upper);
                 }
-                it = g_PendingLevelResets.erase(it);
-                ++processed;
+                if (adjusted)
+                {
+                    it = g_PendingLevelResets.erase(it);
+                    ++processed;
+                }
+                else
+                {
+                    ++it;
+                }
             }
             else
             {
@@ -1782,10 +1885,10 @@ public:
             {
                 LOG_INFO("server.loading", "[BotLevelBrackets] =========================================");
             }
-            std::vector<int> allianceDesiredCounts(g_NumRanges, 0);
+            std::vector<int> allianceDesiredCounts =
+                CalculateDesiredCounts(g_AllianceLevelRanges, totalAllianceBots);
             for (int i = 0; i < g_NumRanges; ++i)
             {
-                allianceDesiredCounts[i] = static_cast<int>(round((g_AllianceLevelRanges[i].desiredPercent / 100.0) * totalAllianceBots));
                 if (g_BotDistFullDebugMode || g_BotDistLiteDebugMode)
                 {
                     LOG_INFO("server.loading", "[BotLevelBrackets] Alliance Range {} ({}-{}): Desired = {}, Actual = {}.",
@@ -1824,6 +1927,13 @@ public:
 
                     int targetRange = targetRanges[targetIdx];
 
+                    if (!CanAssignBotToRange(bot, g_AllianceLevelRanges[targetRange]))
+                    {
+                        safeBots.push_back(bot);
+                        ++targetIdx;
+                        continue;
+                    }
+
                     // Skip if no need (already filled by earlier loop)
                     if (allianceActualCounts[targetRange] >= allianceDesiredCounts[targetRange])
                     {
@@ -1842,14 +1952,14 @@ public:
                             break;
                         }
                     }
-                    if (!alreadyFlagged)
+                    if (alreadyFlagged)
+                        continue;
+
+                    g_PendingLevelResets.push_back({bot->GetGUID(), targetRange, g_AllianceLevelRanges.data()});
+                    if (g_BotDistFullDebugMode)
                     {
-                        g_PendingLevelResets.push_back({bot->GetGUID(), targetRange, g_AllianceLevelRanges.data()});
-                        if (g_BotDistFullDebugMode)
-                        {
-                            LOG_INFO("server.loading", "[BotLevelBrackets] Alliance bot '{}' flagged for pending level reset to range {}-{}.",
-                                bot->GetName(), g_AllianceLevelRanges[targetRange].lower, g_AllianceLevelRanges[targetRange].upper);
-                        }
+                        LOG_INFO("server.loading", "[BotLevelBrackets] Alliance bot '{}' flagged for pending level reset to range {}-{}.",
+                            bot->GetName(), g_AllianceLevelRanges[targetRange].lower, g_AllianceLevelRanges[targetRange].upper);
                     }
                     allianceActualCounts[i]--;
                     allianceActualCounts[targetRange]++;
@@ -1865,6 +1975,13 @@ public:
                     flaggedBots.pop_back();
 
                     int targetRange = targetRanges[targetIdx];
+
+                    if (!CanAssignBotToRange(bot, g_AllianceLevelRanges[targetRange]))
+                    {
+                        flaggedBots.push_back(bot);
+                        ++targetIdx;
+                        continue;
+                    }
 
                     if (allianceActualCounts[targetRange] >= allianceDesiredCounts[targetRange])
                     {
@@ -1882,14 +1999,14 @@ public:
                             break;
                         }
                     }
-                    if (!alreadyFlagged)
+                    if (alreadyFlagged)
+                        continue;
+
+                    g_PendingLevelResets.push_back({bot->GetGUID(), targetRange, g_AllianceLevelRanges.data()});
+                    if (g_BotDistFullDebugMode)
                     {
-                        g_PendingLevelResets.push_back({bot->GetGUID(), targetRange, g_AllianceLevelRanges.data()});
-                        if (g_BotDistFullDebugMode)
-                        {
-                            LOG_INFO("server.loading", "[BotLevelBrackets] Alliance flagged bot '{}' flagged for pending level reset to range {}-{}.",
-                                bot->GetName(), g_AllianceLevelRanges[targetRange].lower, g_AllianceLevelRanges[targetRange].upper);
-                        }
+                        LOG_INFO("server.loading", "[BotLevelBrackets] Alliance flagged bot '{}' flagged for pending level reset to range {}-{}.",
+                            bot->GetName(), g_AllianceLevelRanges[targetRange].lower, g_AllianceLevelRanges[targetRange].upper);
                     }
                     allianceActualCounts[i]--;
                     allianceActualCounts[targetRange]++;
@@ -1907,10 +2024,10 @@ public:
             {
                 LOG_INFO("server.loading", "[BotLevelBrackets] =========================================");
             }
-            std::vector<int> hordeDesiredCounts(g_NumRanges, 0);
+            std::vector<int> hordeDesiredCounts =
+                CalculateDesiredCounts(g_HordeLevelRanges, totalHordeBots);
             for (int i = 0; i < g_NumRanges; ++i)
             {
-                hordeDesiredCounts[i] = static_cast<int>(round((g_HordeLevelRanges[i].desiredPercent / 100.0) * totalHordeBots));
                 if (g_BotDistFullDebugMode || g_BotDistLiteDebugMode)
                 {
                     LOG_INFO("server.loading", "[BotLevelBrackets] Horde Range {} ({}-{}): Desired = {}, Actual = {}.",
@@ -1947,6 +2064,13 @@ public:
 
                     int targetRange = targetRanges[targetIdx];
 
+                    if (!CanAssignBotToRange(bot, g_HordeLevelRanges[targetRange]))
+                    {
+                        safeBots.push_back(bot);
+                        ++targetIdx;
+                        continue;
+                    }
+
                     if (hordeActualCounts[targetRange] >= hordeDesiredCounts[targetRange])
                     {
                         targetIdx++;
@@ -1963,14 +2087,14 @@ public:
                             break;
                         }
                     }
-                    if (!alreadyFlagged)
+                    if (alreadyFlagged)
+                        continue;
+
+                    g_PendingLevelResets.push_back({bot->GetGUID(), targetRange, g_HordeLevelRanges.data()});
+                    if (g_BotDistFullDebugMode)
                     {
-                        g_PendingLevelResets.push_back({bot->GetGUID(), targetRange, g_HordeLevelRanges.data()});
-                        if (g_BotDistFullDebugMode)
-                        {
-                            LOG_INFO("server.loading", "[BotLevelBrackets] Horde bot '{}' flagged for pending level reset to range {}-{}.",
-                                bot->GetName(), g_HordeLevelRanges[targetRange].lower, g_HordeLevelRanges[targetRange].upper);
-                        }
+                        LOG_INFO("server.loading", "[BotLevelBrackets] Horde bot '{}' flagged for pending level reset to range {}-{}.",
+                            bot->GetName(), g_HordeLevelRanges[targetRange].lower, g_HordeLevelRanges[targetRange].upper);
                     }
                     hordeActualCounts[i]--;
                     hordeActualCounts[targetRange]++;
@@ -1986,6 +2110,13 @@ public:
 
                     int targetRange = targetRanges[targetIdx];
 
+                    if (!CanAssignBotToRange(bot, g_HordeLevelRanges[targetRange]))
+                    {
+                        flaggedBots.push_back(bot);
+                        ++targetIdx;
+                        continue;
+                    }
+
                     if (hordeActualCounts[targetRange] >= hordeDesiredCounts[targetRange])
                     {
                         targetIdx++;
@@ -2002,14 +2133,14 @@ public:
                             break;
                         }
                     }
-                    if (!alreadyFlagged)
+                    if (alreadyFlagged)
+                        continue;
+
+                    g_PendingLevelResets.push_back({bot->GetGUID(), targetRange, g_HordeLevelRanges.data()});
+                    if (g_BotDistFullDebugMode)
                     {
-                        g_PendingLevelResets.push_back({bot->GetGUID(), targetRange, g_HordeLevelRanges.data()});
-                        if (g_BotDistFullDebugMode)
-                        {
-                            LOG_INFO("server.loading", "[BotLevelBrackets] Horde flagged bot '{}' flagged for pending level reset to range {}-{}.",
-                                bot->GetName(), g_HordeLevelRanges[targetRange].lower, g_HordeLevelRanges[targetRange].upper);
-                        }
+                        LOG_INFO("server.loading", "[BotLevelBrackets] Horde flagged bot '{}' flagged for pending level reset to range {}-{}.",
+                            bot->GetName(), g_HordeLevelRanges[targetRange].lower, g_HordeLevelRanges[targetRange].upper);
                     }
                     hordeActualCounts[i]--;
                     hordeActualCounts[targetRange]++;
@@ -2026,19 +2157,19 @@ public:
             LOG_INFO("server.loading", "[BotLevelBrackets] Distribution adjustment complete. Alliance bots: {}, Horde bots: {}.",
                      totalAllianceBots, totalHordeBots);
             LOG_INFO("server.loading", "[BotLevelBrackets] =========================================");
-            std::vector<int> allianceDesiredCounts(g_NumRanges, 0);
+            std::vector<int> allianceDesiredCounts =
+                CalculateDesiredCounts(g_AllianceLevelRanges, totalAllianceBots);
             for (int i = 0; i < g_NumRanges; ++i)
             {
-                allianceDesiredCounts[i] = static_cast<int>(round((g_AllianceLevelRanges[i].desiredPercent / 100.0) * totalAllianceBots));
                 LOG_INFO("server.loading", "[BotLevelBrackets] Alliance Range {} ({}-{}): Desired = {}, Actual = {}.",
                          i + 1, g_AllianceLevelRanges[i].lower, g_AllianceLevelRanges[i].upper,
                          allianceDesiredCounts[i], allianceActualCounts[i]);
             }
             LOG_INFO("server.loading", "[BotLevelBrackets] ----------------------------------------");
-            std::vector<int> hordeDesiredCounts(g_NumRanges, 0);
+            std::vector<int> hordeDesiredCounts =
+                CalculateDesiredCounts(g_HordeLevelRanges, totalHordeBots);
             for (int i = 0; i < g_NumRanges; ++i)
             {
-                hordeDesiredCounts[i] = static_cast<int>(round((g_HordeLevelRanges[i].desiredPercent / 100.0) * totalHordeBots));
                 LOG_INFO("server.loading", "[BotLevelBrackets] Horde Range {} ({}-{}): Desired = {}, Actual = {}.",
                          i + 1, g_HordeLevelRanges[i].lower, g_HordeLevelRanges[i].upper,
                          hordeDesiredCounts[i], hordeActualCounts[i]);
