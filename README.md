@@ -1,5 +1,9 @@
 # AzerothCore Module: Bot Level Brackets
 
+> **Retired:** This checkout is retained only for history. Its functionality, configuration,
+> cleanup workflow, and local progression-cap extensions now live in `mod-playerbots` under
+> `AiPlayerbot.LevelBrackets.*`. Do not install this module alongside the integrated implementation.
+
 <p align="center">
   <img src="./icon.png" alt="Bot Level Brackets Icon" title="Bot Level Brackets Icon">
 </p>
